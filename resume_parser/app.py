@@ -1,14 +1,15 @@
 """
 Flask API for uploading and parsing resumes.
 
-This module provides a simple API to upload PDF resumes and extract information from them.
+This module provides a simple API to upload resumes (PDF and DOCX)
+and extract information from them.
 """
 
 import os
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
 import logging
-from parser import ResumeParser
+from parser_factory import parse_resume
 
 # Configure logging
 logging.basicConfig(
@@ -21,7 +22,7 @@ app = Flask(__name__)
 
 # Configuration
 UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'pdf'}
+ALLOWED_EXTENSIONS = {'pdf', 'docx'}
 MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16MB max upload size
 
 app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
@@ -48,13 +49,14 @@ def health_check():
     """API health check endpoint."""
     return jsonify({
         'status': 'healthy',
-        'message': 'Resume parser API is running'
+        'message': 'Resume parser API is running',
+        'supported_formats': list(ALLOWED_EXTENSIONS)
     })
 
 @app.route('/upload', methods=['POST'])
 def upload_resume():
     """
-    Endpoint to upload a resume file (PDF).
+    Endpoint to upload a resume file (PDF or DOCX).
     
     Returns:
         JSON response with upload status and file info
@@ -79,7 +81,7 @@ def upload_resume():
     if not allowed_file(file.filename):
         return jsonify({
             'status': 'error',
-            'message': f'File type not allowed. Please upload a PDF file.',
+            'message': f'File type not allowed. Please upload a PDF or DOCX file.',
             'allowed_extensions': list(ALLOWED_EXTENSIONS)
         }), 400
     
@@ -94,11 +96,12 @@ def upload_resume():
         'status': 'success',
         'message': 'File uploaded successfully',
         'filename': filename,
-        'file_path': file_path
+        'file_path': file_path,
+        'file_type': filename.rsplit('.', 1)[1].lower()
     })
 
 @app.route('/parse', methods=['POST'])
-def parse_resume():
+def parse_resume_api():
     """
     Endpoint to parse a previously uploaded resume.
     
@@ -125,22 +128,28 @@ def parse_resume():
             'message': f'File {filename} not found'
         }), 404
     
-    # Check if the file is a PDF
-    if not filename.lower().endswith('.pdf'):
+    # Check if the file type is supported
+    if not allowed_file(filename):
         return jsonify({
             'status': 'error',
-            'message': f'File {filename} is not a PDF'
+            'message': f'File {filename} has an unsupported format. Supported formats are: {", ".join(ALLOWED_EXTENSIONS)}'
         }), 400
     
     try:
         # Parse the resume
         logger.info(f"Parsing resume: {filename}")
-        parser = ResumeParser(file_path)
-        parsed_data = parser.parse()
+        parsed_data = parse_resume(file_path)
+        
+        if 'error' in parsed_data:
+            return jsonify({
+                'status': 'error',
+                'message': parsed_data['error']
+            }), 500
         
         return jsonify({
             'status': 'success',
-            'data': parsed_data
+            'data': parsed_data,
+            'file_type': filename.rsplit('.', 1)[1].lower()
         })
     except Exception as e:
         logger.error(f"Error parsing resume {filename}: {str(e)}")
@@ -177,7 +186,7 @@ def parse_upload():
     if not allowed_file(file.filename):
         return jsonify({
             'status': 'error',
-            'message': f'File type not allowed. Please upload a PDF file.',
+            'message': f'File type not allowed. Please upload a PDF or DOCX file.',
             'allowed_extensions': list(ALLOWED_EXTENSIONS)
         }), 400
     
@@ -191,13 +200,19 @@ def parse_upload():
         
         # Parse the resume
         logger.info(f"Parsing resume: {filename}")
-        parser = ResumeParser(file_path)
-        parsed_data = parser.parse()
+        parsed_data = parse_resume(file_path)
+        
+        if 'error' in parsed_data:
+            return jsonify({
+                'status': 'error',
+                'message': parsed_data['error']
+            }), 500
         
         return jsonify({
             'status': 'success',
             'message': 'File uploaded and parsed successfully',
             'filename': filename,
+            'file_type': filename.rsplit('.', 1)[1].lower(),
             'data': parsed_data
         })
     except Exception as e:
@@ -206,6 +221,15 @@ def parse_upload():
             'status': 'error',
             'message': f'Error processing resume: {str(e)}'
         }), 500
+
+@app.route('/supported-formats', methods=['GET'])
+def supported_formats():
+    """Return the list of supported file formats."""
+    return jsonify({
+        'status': 'success',
+        'supported_formats': list(ALLOWED_EXTENSIONS),
+        'message': 'These file formats are supported for resume parsing'
+    })
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
