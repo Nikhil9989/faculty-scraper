@@ -9,9 +9,11 @@ and rate limiting.
 import os
 import sys
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
+from fastapi_limiter.depends import RateLimiter
 from pydantic import BaseModel, Field, EmailStr
 import json
 import logging
@@ -104,6 +106,11 @@ class SearchQuery(BaseModel):
     university: Optional[str] = Field(None, description="Filter by university")
     department: Optional[str] = Field(None, description="Filter by department")
     research_areas: Optional[List[str]] = Field(None, description="Filter by research areas")
+
+class RateLimitExceeded(BaseModel):
+    detail: str = Field(..., description="Error detail")
+    limit: int = Field(..., description="Rate limit")
+    reset_after: int = Field(..., description="Seconds until reset")
 
 # Create data directories
 UPLOAD_DIR = "uploads"
@@ -199,11 +206,35 @@ def calculate_compatibility(resume_data, faculty):
         "overall_score": round(overall_score, 2)
     }
 
+# Custom rate limit exceeded handler
+@app.exception_handler(429)
+async def rate_limit_exceeded_handler(request: Request, exc: Exception):
+    """
+    Custom handler for rate limit exceeded errors.
+    """
+    reset_after = getattr(exc, "reset_after", 60)  # Default 60 seconds
+    limit = getattr(exc, "limit", "unknown")
+    
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "detail": "Rate limit exceeded. Please try again later.",
+            "limit": limit,
+            "reset_after": reset_after
+        },
+        headers={"Retry-After": str(reset_after)}
+    )
+
 # Startup event to initialize rate limiter
 @app.on_event("startup")
 async def startup_event():
-    # Initialize rate limiter
+    """Initialize components on startup."""
+    # Setup rate limiter with Redis
     app.limiter = await setup_limiter()
+    if app.limiter:
+        logger.info("Rate limiting is active")
+    else:
+        logger.warning("Rate limiting is NOT active - Redis connection failed")
 
 # Define API endpoints
 @app.get("/")
@@ -212,16 +243,23 @@ async def root():
 
 @app.get("/health")
 async def health_check():
+    """
+    Health check endpoint - not rate limited.
+    """
     return {
         "status": "healthy",
         "time": datetime.now().isoformat(),
         "faculty_count": len(faculty_db),
-        "rate_limiting": app.limiter if hasattr(app, "limiter") else False
+        "rate_limiting": getattr(app, "limiter", False)
     }
 
-# Authentication endpoints (no rate limiting for token endpoint to allow sign in)
+# Authentication endpoints
 @app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    # Apply anonymous rate limit - 20 requests per minute
+    _: None = Depends(RateLimiter(times=20, seconds=60))
+):
     """
     Obtain JWT access token for authentication.
     """
@@ -244,9 +282,10 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
 
 @app.post("/users/", response_model=User)
 async def register_user(
-    user: UserCreate, 
+    user: UserCreate,
     current_user: User = Depends(get_current_admin_user),
-    rate_limiter: None = Depends(rate_limit())
+    # Apply admin-specific rate limit
+    _: None = Depends(rate_limit())
 ):
     """
     Register a new user (admin only).
@@ -263,19 +302,21 @@ async def register_user(
 @app.get("/users/me/", response_model=User)
 async def read_users_me(
     current_user: User = Depends(get_current_active_user),
-    rate_limiter: None = Depends(rate_limit())
+    # Apply regular rate limit
+    _: None = Depends(rate_limit())
 ):
     """
     Get current user information.
     """
     return current_user
 
-# Protected faculty endpoints with rate limiting
+# Protected faculty endpoints
 @app.post("/faculty/search", response_model=List[Faculty])
 async def search_faculty(
     query: SearchQuery = Body(...),
     current_user: User = Depends(get_current_active_user),
-    rate_limiter: None = Depends(rate_limit("/faculty/search"))
+    # Apply endpoint-specific rate limit
+    _: None = Depends(rate_limit("/faculty/search"))
 ):
     """
     Search for faculty members based on criteria.
@@ -287,7 +328,8 @@ async def search_faculty(
 async def get_faculty(
     faculty_id: str,
     current_user: User = Depends(get_current_active_user),
-    rate_limiter: None = Depends(rate_limit())
+    # Apply regular rate limit
+    _: None = Depends(rate_limit())
 ):
     """
     Get details for a specific faculty member.
@@ -301,7 +343,8 @@ async def get_faculty(
 async def create_faculty(
     faculty: Faculty,
     current_user: User = Depends(get_current_admin_user),
-    rate_limiter: None = Depends(rate_limit())
+    # Apply admin-specific rate limit
+    _: None = Depends(rate_limit())
 ):
     """
     Add a new faculty member to the database (admin only).
@@ -321,7 +364,8 @@ async def create_faculty(
 async def upload_resume(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
-    rate_limiter: None = Depends(rate_limit("/resume/upload"))
+    # Apply endpoint-specific rate limit
+    _: None = Depends(rate_limit("/resume/upload"))
 ):
     """
     Upload a resume file (PDF or DOCX).
@@ -355,7 +399,8 @@ async def upload_resume(
 async def parse_resume(
     filename: str = Body(..., embed=True),
     current_user: User = Depends(get_current_active_user),
-    rate_limiter: None = Depends(rate_limit("/resume/parse"))
+    # Apply endpoint-specific rate limit
+    _: None = Depends(rate_limit("/resume/parse"))
 ):
     """
     Parse a previously uploaded resume file.
@@ -393,10 +438,12 @@ async def match_resume_with_faculty(
     resume_data: ResumeData = Body(...),
     top_k: int = Query(5, ge=1, le=20, description="Number of top matches to return"),
     current_user: User = Depends(get_current_active_user),
-    rate_limiter: None = Depends(rate_limit("/match"))
+    # Apply endpoint-specific rate limit for resource-intensive operation
+    _: None = Depends(rate_limit("/match"))
 ):
     """
     Match resume data with faculty profiles and return compatibility scores.
+    This is a resource-intensive endpoint with stricter rate limits.
     """
     # Calculate compatibility for all faculty
     matches = []
@@ -409,23 +456,6 @@ async def match_resume_with_faculty(
     
     # Return top-k matches
     return matches[:top_k]
-
-# Add a middleware to add rate limiting headers to responses
-@app.middleware("http")
-async def add_rate_limit_headers(request, call_next):
-    response = await call_next(request)
-    
-    # If rate limiting is not active, return response as is
-    if not hasattr(app, "limiter") or not app.limiter:
-        return response
-    
-    # Add custom rate limit headers if available
-    if hasattr(request, "state") and hasattr(request.state, "rate_limit_remaining"):
-        response.headers["X-RateLimit-Limit"] = str(getattr(request.state, "rate_limit_limit", "N/A"))
-        response.headers["X-RateLimit-Remaining"] = str(getattr(request.state, "rate_limit_remaining", "N/A"))
-        response.headers["X-RateLimit-Reset"] = str(getattr(request.state, "rate_limit_reset", "N/A"))
-    
-    return response
 
 if __name__ == "__main__":
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
