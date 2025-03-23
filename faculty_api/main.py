@@ -2,15 +2,17 @@
 Faculty Matching API
 
 A FastAPI service that provides endpoints for faculty search,
-resume upload, and compatibility scoring with JWT authentication.
+resume upload, and compatibility scoring with JWT authentication and rate limiting.
 """
 
 import os
 import sys
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query, Depends, status
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query, Depends, status, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
+from fastapi.responses import JSONResponse
+from fastapi_limiter.depends import RateLimiter
 from pydantic import BaseModel, Field, EmailStr
 import json
 import logging
@@ -27,6 +29,9 @@ from auth import (
     create_user, ACCESS_TOKEN_EXPIRE_MINUTES
 )
 
+# Import rate limiting module
+from limiter import setup_limiter, rate_limit
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -37,8 +42,8 @@ logger = logging.getLogger(__name__)
 # Create the FastAPI app
 app = FastAPI(
     title="Faculty Matching API",
-    description="API for faculty search, resume upload, and compatibility scoring",
-    version="1.0.0"
+    description="API for faculty search, resume upload, and compatibility scoring with rate limiting",
+    version="1.1.0"
 )
 
 # Add CORS middleware
@@ -195,6 +200,28 @@ def calculate_compatibility(resume_data, faculty):
         "overall_score": round(overall_score, 2)
     }
 
+# Initialize the rate limiter on startup
+@app.on_event("startup")
+async def startup_event():
+    """Initialize services on startup."""
+    # Initialize rate limiter
+    app.limiter = await setup_limiter()
+    logger.info(f"Rate limiter active: {app.limiter}")
+
+# Handle rate limit exceeded exceptions
+@app.exception_handler(RateLimiter.RateLimitExceeded)
+async def rate_limit_exceeded_handler(request: Request, exc: RateLimiter.RateLimitExceeded):
+    """Return a custom response when rate limit is exceeded."""
+    return JSONResponse(
+        status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+        content={
+            "status": "error",
+            "message": "Rate limit exceeded. Please try again later.",
+            "retry_after": exc.retry_after if hasattr(exc, 'retry_after') else 60
+        },
+        headers={"Retry-After": str(exc.retry_after if hasattr(exc, 'retry_after') else 60)}
+    )
+
 # Define API endpoints
 @app.get("/")
 async def root():
@@ -205,17 +232,24 @@ async def health_check():
     return {
         "status": "healthy",
         "time": datetime.now().isoformat(),
-        "faculty_count": len(faculty_db)
+        "faculty_count": len(faculty_db),
+        "rate_limiting": app.limiter if hasattr(app, "limiter") else False
     }
 
 # Authentication endpoints
 @app.post("/token", response_model=Token)
-async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+async def login_for_access_token(
+    form_data: OAuth2PasswordRequestForm = Depends(),
+    request: Request = None,
+    limiter: RateLimiter = Depends(RateLimiter(times=20, seconds=60))  # 20 requests per minute for login
+):
     """
     Obtain JWT access token for authentication.
     """
     user = authenticate_user(form_data.username, form_data.password)
     if not user:
+        # Add a slight delay to slow down brute force attacks
+        await asyncio.sleep(1)
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect email or password",
@@ -232,7 +266,11 @@ async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends(
     return {"access_token": access_token, "token_type": "bearer"}
 
 @app.post("/users/", response_model=User)
-async def register_user(user: UserCreate, current_user: User = Depends(get_current_admin_user)):
+async def register_user(
+    user: UserCreate, 
+    current_user: User = Depends(get_current_admin_user),
+    rate_limiter = Depends(rate_limit())
+):
     """
     Register a new user (admin only).
     """
@@ -246,7 +284,10 @@ async def register_user(user: UserCreate, current_user: User = Depends(get_curre
     return created_user
 
 @app.get("/users/me/", response_model=User)
-async def read_users_me(current_user: User = Depends(get_current_active_user)):
+async def read_users_me(
+    current_user: User = Depends(get_current_active_user),
+    rate_limiter = Depends(rate_limit())
+):
     """
     Get current user information.
     """
@@ -256,7 +297,8 @@ async def read_users_me(current_user: User = Depends(get_current_active_user)):
 @app.post("/faculty/search", response_model=List[Faculty])
 async def search_faculty(
     query: SearchQuery = Body(...),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    rate_limiter = Depends(rate_limit("/faculty/search"))
 ):
     """
     Search for faculty members based on criteria.
@@ -267,7 +309,8 @@ async def search_faculty(
 @app.get("/faculty/{faculty_id}", response_model=Faculty)
 async def get_faculty(
     faculty_id: str,
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    rate_limiter = Depends(rate_limit())
 ):
     """
     Get details for a specific faculty member.
@@ -280,7 +323,8 @@ async def get_faculty(
 @app.post("/faculty", response_model=Faculty)
 async def create_faculty(
     faculty: Faculty,
-    current_user: User = Depends(get_current_admin_user)
+    current_user: User = Depends(get_current_admin_user),
+    rate_limiter = Depends(rate_limit())
 ):
     """
     Add a new faculty member to the database (admin only).
@@ -299,7 +343,8 @@ async def create_faculty(
 @app.post("/resume/upload")
 async def upload_resume(
     file: UploadFile = File(...),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    rate_limiter = Depends(rate_limit("/resume/upload"))
 ):
     """
     Upload a resume file (PDF or DOCX).
@@ -332,7 +377,8 @@ async def upload_resume(
 @app.post("/resume/parse", response_model=ResumeData)
 async def parse_resume(
     filename: str = Body(..., embed=True),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    rate_limiter = Depends(rate_limit("/resume/parse"))
 ):
     """
     Parse a previously uploaded resume file.
@@ -369,7 +415,8 @@ async def parse_resume(
 async def match_resume_with_faculty(
     resume_data: ResumeData = Body(...),
     top_k: int = Query(5, ge=1, le=20, description="Number of top matches to return"),
-    current_user: User = Depends(get_current_active_user)
+    current_user: User = Depends(get_current_active_user),
+    rate_limiter = Depends(rate_limit("/match"))
 ):
     """
     Match resume data with faculty profiles and return compatibility scores.
@@ -387,4 +434,5 @@ async def match_resume_with_faculty(
     return matches[:top_k]
 
 if __name__ == "__main__":
+    import asyncio
     uvicorn.run("main:app", host="0.0.0.0", port=8000, reload=True)
