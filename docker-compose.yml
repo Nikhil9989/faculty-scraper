@@ -1,0 +1,60 @@
+version: '3.8'
+
+services:
+  # Main application container
+  app:
+    build: .
+    container_name: faculty-matcher-app
+    ports:
+      - "8000:8000"  # Faculty API
+      - "5000:5000"  # Resume Parser API
+    volumes:
+      - ./data:/app/data
+      - ./uploads:/app/uploads
+    environment:
+      - DB_HOST=db
+      - DB_PORT=5432
+      - DB_NAME=faculty_db
+      - DB_USER=postgres
+      - DB_PASSWORD=postgres
+      - JWT_SECRET=YourSecretKeyHere
+      - API_RATE_LIMIT=100
+    depends_on:
+      - db
+    networks:
+      - faculty-network
+    restart: unless-stopped
+    command: python main.py start-all
+
+  # PostgreSQL database
+  db:
+    image: postgres:14-alpine
+    container_name: faculty-matcher-db
+    volumes:
+      - postgres_data:/var/lib/postgresql/data/
+    environment:
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_USER=postgres
+      - POSTGRES_DB=faculty_db
+    ports:
+      - "5432:5432"
+    networks:
+      - faculty-network
+    restart: unless-stopped
+
+  # Redis for rate limiting and caching
+  redis:
+    image: redis:alpine
+    container_name: faculty-matcher-redis
+    ports:
+      - "6379:6379"
+    networks:
+      - faculty-network
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+
+networks:
+  faculty-network:
+    driver: bridge
