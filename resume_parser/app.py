@@ -7,6 +7,15 @@ This module provides a simple API to upload PDF resumes and extract information 
 import os
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
+import logging
+from parser import ResumeParser
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
@@ -79,6 +88,8 @@ def upload_resume():
     file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
     file.save(file_path)
     
+    logger.info(f"Successfully uploaded file: {filename}")
+    
     return jsonify({
         'status': 'success',
         'message': 'File uploaded successfully',
@@ -114,16 +125,87 @@ def parse_resume():
             'message': f'File {filename} not found'
         }), 404
     
-    # Basic placeholder for PDF parsing (to be implemented)
-    parsed_data = {
-        'filename': filename,
-        'message': 'Parsing functionality will be implemented in the next version'
-    }
+    # Check if the file is a PDF
+    if not filename.lower().endswith('.pdf'):
+        return jsonify({
+            'status': 'error',
+            'message': f'File {filename} is not a PDF'
+        }), 400
     
-    return jsonify({
-        'status': 'success',
-        'data': parsed_data
-    })
+    try:
+        # Parse the resume
+        logger.info(f"Parsing resume: {filename}")
+        parser = ResumeParser(file_path)
+        parsed_data = parser.parse()
+        
+        return jsonify({
+            'status': 'success',
+            'data': parsed_data
+        })
+    except Exception as e:
+        logger.error(f"Error parsing resume {filename}: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'Error parsing resume: {str(e)}'
+        }), 500
+
+@app.route('/parse-upload', methods=['POST'])
+def parse_upload():
+    """
+    Endpoint to upload and parse a resume in one step.
+    
+    Returns:
+        JSON response with parsed resume data
+    """
+    # Check if the post request has the file part
+    if 'file' not in request.files:
+        return jsonify({
+            'status': 'error',
+            'message': 'No file part in the request'
+        }), 400
+    
+    file = request.files['file']
+    
+    # Check if the user submitted an empty form
+    if file.filename == '':
+        return jsonify({
+            'status': 'error',
+            'message': 'No file selected'
+        }), 400
+    
+    # Check if the file is allowed
+    if not allowed_file(file.filename):
+        return jsonify({
+            'status': 'error',
+            'message': f'File type not allowed. Please upload a PDF file.',
+            'allowed_extensions': list(ALLOWED_EXTENSIONS)
+        }), 400
+    
+    try:
+        # Save the file
+        filename = secure_filename(file.filename)
+        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
+        file.save(file_path)
+        
+        logger.info(f"Successfully uploaded file: {filename}")
+        
+        # Parse the resume
+        logger.info(f"Parsing resume: {filename}")
+        parser = ResumeParser(file_path)
+        parsed_data = parser.parse()
+        
+        return jsonify({
+            'status': 'success',
+            'message': 'File uploaded and parsed successfully',
+            'filename': filename,
+            'data': parsed_data
+        })
+    except Exception as e:
+        logger.error(f"Error processing resume {file.filename}: {str(e)}")
+        return jsonify({
+            'status': 'error',
+            'message': f'Error processing resume: {str(e)}'
+        }), 500
 
 if __name__ == '__main__':
     app.run(debug=True, host='0.0.0.0', port=5000)
