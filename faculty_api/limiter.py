@@ -1,16 +1,16 @@
 """
-Rate limiting module for Faculty API.
+Rate Limiting module for Faculty API
 
-This module provides customized rate limiting functionality based on user roles.
+This module provides the rate limiting implementation using slowapi
+with different rate limits for different endpoints.
 """
 
-import time
-from typing import Callable, Dict, Optional, Tuple, Union
-from fastapi import Depends, HTTPException, Request, status
-from auth import User, get_current_active_user, get_current_admin_user, is_admin
-import redis.asyncio
-from fastapi_limiter import FastAPILimiter
-from fastapi_limiter.depends import RateLimiter
+import os
+import redis
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from fastapi import Depends, Request
+from functools import wraps
 import logging
 
 # Configure logging
@@ -20,121 +20,125 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Rate limiting configuration
-DEFAULT_RATE_LIMIT_ANONYMOUS = (20, 60)  # 20 requests per minute for anonymous endpoints
-DEFAULT_RATE_LIMIT_USER = (100, 60)  # 100 requests per minute for authenticated users
-DEFAULT_RATE_LIMIT_ADMIN = (300, 60)  # 300 requests per minute for admin users
+# Configuration from environment variables
+REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
+REDIS_PORT = int(os.getenv("REDIS_PORT", "6379"))
+REDIS_DB = int(os.getenv("REDIS_DB", "0"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD", None)
 
-# Endpoint-specific rate limits
+# Define rate limits (can be configured from environment variables)
+DEFAULT_RATE_LIMIT = os.getenv("DEFAULT_RATE_LIMIT", "60/minute")
+FACULTY_SEARCH_LIMIT = os.getenv("FACULTY_SEARCH_LIMIT", "30/minute")
+RESUME_UPLOAD_LIMIT = os.getenv("RESUME_UPLOAD_LIMIT", "10/minute")
+RESUME_PARSE_LIMIT = os.getenv("RESUME_PARSE_LIMIT", "20/minute")
+MATCH_RATE_LIMIT = os.getenv("MATCH_RATE_LIMIT", "15/minute")
+
+# Define endpoint-specific rate limits
 ENDPOINT_LIMITS = {
-    "/match": (30, 60),  # Resource-intensive endpoint
-    "/faculty/search": (50, 60),  # Search endpoint
-    "/resume/upload": (10, 60),  # File upload endpoint
-    "/resume/parse": (20, 60),  # File processing endpoint
+    "/faculty/search": FACULTY_SEARCH_LIMIT,
+    "/resume/upload": RESUME_UPLOAD_LIMIT,
+    "/resume/parse": RESUME_PARSE_LIMIT,
+    "/match": MATCH_RATE_LIMIT
 }
 
-# Redis connection string (in production, get from environment variables)
-REDIS_URL = "redis://localhost:6379/0"
+# Global limiter instance
+limiter = None
 
 async def setup_limiter():
-    """Setup Redis connection for rate limiting."""
+    """
+    Setup and initialize the rate limiter with Redis backend.
+    """
+    global limiter
+    
     try:
-        redis_connection = redis.asyncio.from_url(REDIS_URL, encoding="utf-8", decode_responses=True)
-        await FastAPILimiter.init(redis_connection)
-        logger.info("Rate limiter initialized with Redis")
-        return True
+        # Create Redis connection
+        redis_client = redis.Redis(
+            host=REDIS_HOST,
+            port=REDIS_PORT,
+            db=REDIS_DB,
+            password=REDIS_PASSWORD,
+            decode_responses=True
+        )
+        
+        # Test Redis connection
+        redis_client.ping()
+        
+        # Create limiter with Redis backend
+        limiter = Limiter(
+            key_func=get_key_func,
+            default_limits=[DEFAULT_RATE_LIMIT],
+            storage_uri=f"redis://{REDIS_HOST}:{REDIS_PORT}/{REDIS_DB}"
+        )
+        
+        logger.info("Rate limiter initialized with Redis backend")
+        return limiter
+        
+    except redis.exceptions.ConnectionError as e:
+        logger.error(f"Failed to connect to Redis: {e}")
+        
+        # Fallback to memory storage if Redis is not available
+        limiter = Limiter(
+            key_func=get_key_func,
+            default_limits=[DEFAULT_RATE_LIMIT]
+        )
+        
+        logger.warning("Rate limiter initialized with memory storage (fallback)")
+        return limiter
+    
     except Exception as e:
-        logger.warning(f"Failed to initialize rate limiter: {e}")
-        logger.warning("Rate limiting will not be active!")
-        return False
+        logger.error(f"Error initializing rate limiter: {e}")
+        return None
 
-class RoleLimiter:
+def get_key_func(request: Request) -> str:
     """
-    Rate limiter that applies different limits based on user role.
+    Get a unique key for rate limiting based on user identity or IP.
+    
+    For authenticated requests, uses the user's email.
+    For anonymous requests, uses the IP address.
     """
+    # If user is authenticated, use their email as the key
+    if hasattr(request.state, "user") and request.state.user:
+        return f"user:{request.state.user.email}"
     
-    def __init__(
-        self,
-        anonymous_limit: Tuple[int, int] = DEFAULT_RATE_LIMIT_ANONYMOUS,
-        user_limit: Tuple[int, int] = DEFAULT_RATE_LIMIT_USER,
-        admin_limit: Tuple[int, int] = DEFAULT_RATE_LIMIT_ADMIN,
-        endpoint: Optional[str] = None
-    ):
-        """
-        Initialize role-based rate limiter.
-        
-        Args:
-            anonymous_limit: Tuple of (requests, seconds) for anonymous access
-            user_limit: Tuple of (requests, seconds) for normal users
-            admin_limit: Tuple of (requests, seconds) for admin users
-            endpoint: If provided, use endpoint-specific limits instead of defaults
-        """
-        # Use endpoint-specific limits if available
-        if endpoint and endpoint in ENDPOINT_LIMITS:
-            self.endpoint_limit = ENDPOINT_LIMITS[endpoint]
-        else:
-            self.endpoint_limit = None
-            
-        self.anonymous_limit = anonymous_limit
-        self.user_limit = user_limit
-        self.admin_limit = admin_limit
-    
-    def get_limit_for_endpoint(self, is_admin_user: bool) -> Tuple[int, int]:
-        """Get appropriate limit for an endpoint based on user role."""
-        # Use endpoint-specific limit if available
-        if self.endpoint_limit:
-            times, seconds = self.endpoint_limit
-            
-            # Scale up limits for admin users by 50%
-            if is_admin_user:
-                times = int(times * 1.5)
-                
-            return times, seconds
-            
-        # Otherwise use role-based default limits
-        if is_admin_user:
-            return self.admin_limit
-        else:
-            return self.user_limit
-    
-    async def __call__(self, request: Request, user: User = Depends(get_current_active_user)) -> None:
-        """
-        Apply rate limiting based on user role.
-        
-        Args:
-            request: FastAPI request object
-            user: Current authenticated user
-        
-        Raises:
-            HTTPException: If rate limit is exceeded
-        """
-        if not hasattr(request.app, "limiter") or not request.app.limiter:
-            # Rate limiting not initialized, skip check
-            return
-            
-        # Get appropriate limit based on user role
-        admin_user = is_admin(user)
-        times, seconds = self.get_limit_for_endpoint(admin_user)
-        
-        # Create a rate limiter with the appropriate limits
-        limiter = RateLimiter(times=times, seconds=seconds)
-        
-        # Use the user's ID as part of the Redis key for rate limiting
-        # This ensures each user has their own rate limit
-        request.state.user_id = user.id
-        
-        # Apply the rate limit
-        await limiter(request)
+    # Otherwise use IP address
+    return f"ip:{get_remote_address(request)}"
 
-# Helper function for applying rate limits to authenticated endpoints
-def rate_limit(endpoint: Optional[str] = None):
+def rate_limit(endpoint_path=None):
     """
-    Apply role-based rate limiting to an endpoint.
+    Factory function to create a rate limiter dependency with the appropriate
+    limit for a given endpoint.
     
     Args:
-        endpoint: Optional endpoint path for endpoint-specific limits
-    
+        endpoint_path: Optional endpoint path to apply specific rate limit
+        
     Returns:
-        Dependency callable for FastAPI
+        A dependency function that will apply rate limiting
     """
-    return RoleLimiter(endpoint=endpoint)
+    from fastapi_limiter.depends import RateLimiter
+    
+    # Get the appropriate limit for this endpoint
+    limit = ENDPOINT_LIMITS.get(endpoint_path, DEFAULT_RATE_LIMIT)
+    
+    # Parse the limit (format: "number/timeunit")
+    parts = limit.split("/")
+    if len(parts) != 2:
+        # Fallback to default if format is invalid
+        times, seconds = 60, 60  # 60 per minute default
+    else:
+        times = int(parts[0])
+        
+        # Convert time unit to seconds
+        time_unit = parts[1].lower()
+        if time_unit == "second":
+            seconds = 1
+        elif time_unit == "minute":
+            seconds = 60
+        elif time_unit == "hour":
+            seconds = 3600
+        elif time_unit == "day":
+            seconds = 86400
+        else:
+            seconds = 60  # Default to minute
+    
+    # Create and return the limiter dependency
+    return RateLimiter(times=times, seconds=seconds)
