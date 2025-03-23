@@ -5,7 +5,7 @@ A Flask-based API for uploading and parsing student resumes to extract relevant 
 ## Overview
 
 This API allows users to:
-- Upload resume files (PDF)
+- Upload resume files (PDF and DOCX formats)
 - Parse resumes to extract key information (name, education, research interests)
 - Return structured data that can be used for matching with faculty profiles
 
@@ -17,14 +17,20 @@ GET /health
 ```
 Returns the current status of the API.
 
+### Supported Formats
+```
+GET /supported-formats
+```
+Returns the list of supported file formats for resume parsing.
+
 ### Upload Resume
 ```
 POST /upload
 ```
-Upload a resume file (PDF).
+Upload a resume file (PDF or DOCX).
 
 **Request:**
-- Form data with a 'file' field containing the resume PDF
+- Form data with a 'file' field containing the resume file
 
 **Response:**
 ```json
@@ -32,7 +38,8 @@ Upload a resume file (PDF).
   "status": "success",
   "message": "File uploaded successfully",
   "filename": "resume.pdf",
-  "file_path": "uploads/resume.pdf"
+  "file_path": "uploads/resume.pdf",
+  "file_type": "pdf"
 }
 ```
 
@@ -68,9 +75,29 @@ Parse a previously uploaded resume.
       "Natural Language Processing",
       "Computer Vision"
     ]
-  }
+  },
+  "file_type": "pdf"
 }
 ```
+
+### Parse and Upload
+```
+POST /parse-upload
+```
+Upload and parse a resume in a single API call.
+
+**Request:**
+- Form data with a 'file' field containing the resume file
+
+**Response:**
+- Same as `/parse` endpoint, but includes upload information as well
+
+## Supported File Formats
+
+Currently, the resume parser supports:
+
+- PDF documents (`.pdf`)
+- Microsoft Word documents (`.docx`)
 
 ## Installation
 
@@ -82,6 +109,9 @@ cd faculty-scraper/resume_parser
 # Install dependencies
 pip install -r requirements.txt
 
+# Download spaCy model (optional but recommended)
+python -m spacy download en_core_web_sm
+
 # Run the API
 python app.py
 ```
@@ -90,10 +120,20 @@ python app.py
 
 - Flask: Web framework for the API
 - Werkzeug: Utility library for Flask
-- PyMuPDF (coming soon): For PDF parsing
+- PyMuPDF: For PDF parsing
+- python-docx: For DOCX parsing
+- spaCy: For natural language processing and entity extraction
+
+## Architecture
+
+The parser uses a factory pattern to support multiple file formats:
+
+- `ResumeParser`: Base parser implementation for PDF files
+- `DocxResumeParser`: Implementation for DOCX files
+- `ParserFactory`: Creates the appropriate parser based on file extension
 
 ## Future Enhancements
 
-- Support for DOCX files
+- Support for additional file formats (RTF, TXT, HTML)
 - Improved parsing accuracy
 - Integration with faculty matching algorithm
