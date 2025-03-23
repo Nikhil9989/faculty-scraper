@@ -2,21 +2,30 @@
 Faculty Matching API
 
 A FastAPI service that provides endpoints for faculty search,
-resume upload, and compatibility scoring.
+resume upload, and compatibility scoring with JWT authentication.
 """
 
 import os
 import sys
 from typing import List, Optional, Dict, Any
-from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query, Depends
+from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query, Depends, status
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from fastapi.security import OAuth2PasswordRequestForm
+from pydantic import BaseModel, Field, EmailStr
 import json
 import logging
 import uuid
 import uvicorn
-from datetime import datetime
+from datetime import datetime, timedelta
 import shutil
+
+# Import authentication module
+from auth import (
+    User, UserCreate, Token, 
+    create_access_token, authenticate_user, 
+    get_current_active_user, get_current_admin_user,
+    create_user, ACCESS_TOKEN_EXPIRE_MINUTES
+)
 
 # Configure logging
 logging.basicConfig(
@@ -199,8 +208,56 @@ async def health_check():
         "faculty_count": len(faculty_db)
     }
 
+# Authentication endpoints
+@app.post("/token", response_model=Token)
+async def login_for_access_token(form_data: OAuth2PasswordRequestForm = Depends()):
+    """
+    Obtain JWT access token for authentication.
+    """
+    user = authenticate_user(form_data.username, form_data.password)
+    if not user:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Incorrect email or password",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    
+    # Create access token with user information
+    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    access_token = create_access_token(
+        data={"sub": user.email, "role": user.role},
+        expires_delta=access_token_expires
+    )
+    
+    return {"access_token": access_token, "token_type": "bearer"}
+
+@app.post("/users/", response_model=User)
+async def register_user(user: UserCreate, current_user: User = Depends(get_current_admin_user)):
+    """
+    Register a new user (admin only).
+    """
+    created_user = create_user(user)
+    if not created_user:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail="User with this email already exists"
+        )
+    
+    return created_user
+
+@app.get("/users/me/", response_model=User)
+async def read_users_me(current_user: User = Depends(get_current_active_user)):
+    """
+    Get current user information.
+    """
+    return current_user
+
+# Protected faculty endpoints
 @app.post("/faculty/search", response_model=List[Faculty])
-async def search_faculty(query: SearchQuery = Body(...)):
+async def search_faculty(
+    query: SearchQuery = Body(...),
+    current_user: User = Depends(get_current_active_user)
+):
     """
     Search for faculty members based on criteria.
     """
@@ -208,7 +265,10 @@ async def search_faculty(query: SearchQuery = Body(...)):
     return filtered
 
 @app.get("/faculty/{faculty_id}", response_model=Faculty)
-async def get_faculty(faculty_id: str):
+async def get_faculty(
+    faculty_id: str,
+    current_user: User = Depends(get_current_active_user)
+):
     """
     Get details for a specific faculty member.
     """
@@ -218,9 +278,12 @@ async def get_faculty(faculty_id: str):
     raise HTTPException(status_code=404, detail="Faculty not found")
 
 @app.post("/faculty", response_model=Faculty)
-async def create_faculty(faculty: Faculty):
+async def create_faculty(
+    faculty: Faculty,
+    current_user: User = Depends(get_current_admin_user)
+):
     """
-    Add a new faculty member to the database.
+    Add a new faculty member to the database (admin only).
     """
     faculty_dict = faculty.dict()
     
@@ -234,7 +297,10 @@ async def create_faculty(faculty: Faculty):
     return faculty_dict
 
 @app.post("/resume/upload")
-async def upload_resume(file: UploadFile = File(...)):
+async def upload_resume(
+    file: UploadFile = File(...),
+    current_user: User = Depends(get_current_active_user)
+):
     """
     Upload a resume file (PDF or DOCX).
     """
@@ -264,7 +330,10 @@ async def upload_resume(file: UploadFile = File(...)):
     }
 
 @app.post("/resume/parse", response_model=ResumeData)
-async def parse_resume(filename: str = Body(..., embed=True)):
+async def parse_resume(
+    filename: str = Body(..., embed=True),
+    current_user: User = Depends(get_current_active_user)
+):
     """
     Parse a previously uploaded resume file.
     """
@@ -299,7 +368,8 @@ async def parse_resume(filename: str = Body(..., embed=True)):
 @app.post("/match", response_model=List[MatchResult])
 async def match_resume_with_faculty(
     resume_data: ResumeData = Body(...),
-    top_k: int = Query(5, ge=1, le=20, description="Number of top matches to return")
+    top_k: int = Query(5, ge=1, le=20, description="Number of top matches to return"),
+    current_user: User = Depends(get_current_active_user)
 ):
     """
     Match resume data with faculty profiles and return compatibility scores.
