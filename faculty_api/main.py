@@ -13,7 +13,6 @@ from fastapi import FastAPI, HTTPException, UploadFile, File, Form, Body, Query,
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.security import OAuth2PasswordRequestForm
 from fastapi.responses import JSONResponse
-from fastapi_limiter.depends import RateLimiter
 from pydantic import BaseModel, Field, EmailStr
 import json
 import logging
@@ -230,8 +229,8 @@ async def rate_limit_exceeded_handler(request: Request, exc: Exception):
 async def startup_event():
     """Initialize components on startup."""
     # Setup rate limiter with Redis
-    app.limiter = await setup_limiter()
-    if app.limiter:
+    app.state.limiter = await setup_limiter()
+    if app.state.limiter:
         logger.info("Rate limiting is active")
     else:
         logger.warning("Rate limiting is NOT active - Redis connection failed")
@@ -250,15 +249,14 @@ async def health_check():
         "status": "healthy",
         "time": datetime.now().isoformat(),
         "faculty_count": len(faculty_db),
-        "rate_limiting": getattr(app, "limiter", False)
+        "rate_limiting": hasattr(app.state, "limiter") and app.state.limiter is not None
     }
 
 # Authentication endpoints
 @app.post("/token", response_model=Token)
 async def login_for_access_token(
     form_data: OAuth2PasswordRequestForm = Depends(),
-    # Apply anonymous rate limit - 20 requests per minute
-    _: None = Depends(RateLimiter(times=20, seconds=60))
+    _: None = Depends(rate_limit())  # Apply default rate limit
 ):
     """
     Obtain JWT access token for authentication.
@@ -284,8 +282,7 @@ async def login_for_access_token(
 async def register_user(
     user: UserCreate,
     current_user: User = Depends(get_current_admin_user),
-    # Apply admin-specific rate limit
-    _: None = Depends(rate_limit())
+    _: None = Depends(rate_limit())  # Apply default rate limit
 ):
     """
     Register a new user (admin only).
@@ -302,8 +299,7 @@ async def register_user(
 @app.get("/users/me/", response_model=User)
 async def read_users_me(
     current_user: User = Depends(get_current_active_user),
-    # Apply regular rate limit
-    _: None = Depends(rate_limit())
+    _: None = Depends(rate_limit())  # Apply default rate limit
 ):
     """
     Get current user information.
@@ -315,8 +311,7 @@ async def read_users_me(
 async def search_faculty(
     query: SearchQuery = Body(...),
     current_user: User = Depends(get_current_active_user),
-    # Apply endpoint-specific rate limit
-    _: None = Depends(rate_limit("/faculty/search"))
+    _: None = Depends(rate_limit("/faculty/search"))  # Apply endpoint-specific rate limit
 ):
     """
     Search for faculty members based on criteria.
@@ -328,8 +323,7 @@ async def search_faculty(
 async def get_faculty(
     faculty_id: str,
     current_user: User = Depends(get_current_active_user),
-    # Apply regular rate limit
-    _: None = Depends(rate_limit())
+    _: None = Depends(rate_limit())  # Apply default rate limit
 ):
     """
     Get details for a specific faculty member.
@@ -343,8 +337,7 @@ async def get_faculty(
 async def create_faculty(
     faculty: Faculty,
     current_user: User = Depends(get_current_admin_user),
-    # Apply admin-specific rate limit
-    _: None = Depends(rate_limit())
+    _: None = Depends(rate_limit())  # Apply default rate limit
 ):
     """
     Add a new faculty member to the database (admin only).
@@ -364,8 +357,7 @@ async def create_faculty(
 async def upload_resume(
     file: UploadFile = File(...),
     current_user: User = Depends(get_current_active_user),
-    # Apply endpoint-specific rate limit
-    _: None = Depends(rate_limit("/resume/upload"))
+    _: None = Depends(rate_limit("/resume/upload"))  # Apply endpoint-specific rate limit
 ):
     """
     Upload a resume file (PDF or DOCX).
@@ -399,8 +391,7 @@ async def upload_resume(
 async def parse_resume(
     filename: str = Body(..., embed=True),
     current_user: User = Depends(get_current_active_user),
-    # Apply endpoint-specific rate limit
-    _: None = Depends(rate_limit("/resume/parse"))
+    _: None = Depends(rate_limit("/resume/parse"))  # Apply endpoint-specific rate limit
 ):
     """
     Parse a previously uploaded resume file.
@@ -438,8 +429,7 @@ async def match_resume_with_faculty(
     resume_data: ResumeData = Body(...),
     top_k: int = Query(5, ge=1, le=20, description="Number of top matches to return"),
     current_user: User = Depends(get_current_active_user),
-    # Apply endpoint-specific rate limit for resource-intensive operation
-    _: None = Depends(rate_limit("/match"))
+    _: None = Depends(rate_limit("/match"))  # Apply endpoint-specific rate limit
 ):
     """
     Match resume data with faculty profiles and return compatibility scores.
